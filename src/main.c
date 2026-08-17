@@ -4,6 +4,7 @@
  */
 
 #include "pico/stdlib.h"
+#include "tusb.h"
 #include "usb_transport.h"
 #include "console.h"
 #include "i2c_interface.h"

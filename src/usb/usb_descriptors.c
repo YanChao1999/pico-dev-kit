@@ -5,6 +5,7 @@
 
 #include "tusb.h"
 #include "pico/unique_id.h"
+#include <stdio.h>
 #include <string.h>
 
 /* -------------------------------------------------------------------------

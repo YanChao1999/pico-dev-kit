@@ -109,20 +109,37 @@ void recorder_push(const frame_t *frame) {
 }
 
 void recorder_task(void) {
-    /* Drain available data to USB in chunks */
+    /* Drain available data to USB in chunks; only advance the ring
+     * after a successful write so partial/failed TX can be retried. */
     while (s_tail != s_head) {
-        /* Build a local chunk to avoid byte-at-a-time USB writes */
         uint8_t  chunk[64];
         uint32_t n = 0;
+        uint32_t peek_tail;
 
         critical_section_enter_blocking(&s_cs);
-        while (s_tail != s_head && n < sizeof(chunk)) {
-            chunk[n++] = s_ring[s_tail & (RING_SIZE - 1)];
-            s_tail++;
+        peek_tail = s_tail;
+        while (peek_tail != s_head && n < sizeof(chunk)) {
+            chunk[n++] = s_ring[peek_tail & (RING_SIZE - 1)];
+            peek_tail++;
         }
         critical_section_exit(&s_cs);
 
-        usb_data_write(chunk, n);
+        if (n == 0) {
+            break;
+        }
+
+        uint32_t written = usb_data_write(chunk, n);
+        if (written == 0) {
+            break;  /* USB not ready – keep bytes in the ring */
+        }
+
+        critical_section_enter_blocking(&s_cs);
+        s_tail += written;
+        critical_section_exit(&s_cs);
+
+        if (written < n) {
+            break;  /* partial write – retry remainder next tick */
+        }
     }
 }
 

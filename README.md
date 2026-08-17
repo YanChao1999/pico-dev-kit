@@ -74,14 +74,18 @@ Flash `pico_dev_kit.uf2` to the Pico (hold BOOTSEL while plugging in).
 | Signal | GPIO | Notes |
 |---|---|---|
 | SPI SCK | 2 | |
-| SPI TX  | 3 | |
-| SPI RX  | 0 | |
+| SPI TX  | 3 | MOSI |
+| SPI RX  | 0 | MISO |
 | SPI CS  | 1 | Active-low (master); driven by master (slave) |
 | I2C SDA | 4 | Pull-up required |
 | I2C SCL | 5 | Pull-up required |
 
 Pins can be overridden by defining `SPI_SCK_PIN`, `SPI_TX_PIN`, etc. in
 `CMakeLists.txt` via `target_compile_definitions`.
+
+PIO monitor mode requires contiguous pin blocks: I2C SDA/SCL must be
+adjacent (`SCL = SDA + 1`); SPI must keep the RX/CS/SCK/TX quartet as
+`base, base+1, base+2, base+3` (the defaults above).
 
 ## License
 

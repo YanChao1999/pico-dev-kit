@@ -41,6 +41,12 @@ typedef struct {
 static pio_mon_state_t s_i2c;
 static pio_mon_state_t s_spi;
 
+/* Accumulators shared by data drain and event (START/STOP / CS) handlers */
+static uint8_t  s_i2c_buf[FRAME_DATA_MAX];
+static uint16_t s_i2c_count;
+static uint8_t  s_spi_buf[FRAME_DATA_MAX];
+static uint16_t s_spi_count;
+
 /* Optional callback invoked for every decoded frame (before recorder push) */
 static void (*s_frame_cb)(const frame_t *) = NULL;
 
@@ -52,6 +58,29 @@ static void deliver_frame(const frame_t *f) {
         s_frame_cb(f);
     }
     recorder_push(f);
+}
+
+static void flush_buf(interface_id_t iface, uint8_t *buf, uint16_t *count) {
+    if (*count == 0) {
+        return;
+    }
+    frame_t frame;
+    frame.timestamp_us = (uint32_t)to_us_since_boot(get_absolute_time());
+    frame.iface  = iface;
+    frame.role   = ROLE_MONITOR;
+    frame.length = *count;
+    memcpy(frame.data, buf, *count);
+    deliver_frame(&frame);
+    *count = 0;
+}
+
+static void emit_sentinel(interface_id_t iface) {
+    frame_t frame;
+    frame.timestamp_us = (uint32_t)to_us_since_boot(get_absolute_time());
+    frame.iface  = iface;
+    frame.role   = ROLE_MONITOR;
+    frame.length = 0;
+    deliver_frame(&frame);
 }
 
 /* -------------------------------------------------------------------------
@@ -66,9 +95,6 @@ static void deliver_frame(const frame_t *f) {
  * We unpack 8 data bits and the ACK flag and record the byte.
  */
 static void i2c_drain_data(void) {
-    static uint8_t  byte_buf[FRAME_DATA_MAX];
-    static uint16_t byte_count = 0;
-
     while (!pio_sm_is_rx_fifo_empty(s_i2c.pio, s_i2c.sm_data)) {
         uint32_t word = pio_sm_get(s_i2c.pio, s_i2c.sm_data);
         /*
@@ -83,20 +109,13 @@ static void i2c_drain_data(void) {
         uint8_t  byte = (uint8_t)(raw >> 1);
         /* uint8_t ack  = (uint8_t)(raw & 1); */  /* available if needed */
 
-        if (byte_count < FRAME_DATA_MAX) {
-            byte_buf[byte_count++] = byte;
+        if (s_i2c_count < FRAME_DATA_MAX) {
+            s_i2c_buf[s_i2c_count++] = byte;
         }
 
         /* Flush a frame whenever the buffer is full */
-        if (byte_count == FRAME_DATA_MAX) {
-            frame_t frame;
-            frame.timestamp_us = (uint32_t)to_us_since_boot(get_absolute_time());
-            frame.iface  = IFACE_I2C;
-            frame.role   = ROLE_MONITOR;
-            frame.length = byte_count;
-            memcpy(frame.data, byte_buf, byte_count);
-            deliver_frame(&frame);
-            byte_count = 0;
+        if (s_i2c_count == FRAME_DATA_MAX) {
+            flush_buf(IFACE_I2C, s_i2c_buf, &s_i2c_count);
         }
     }
 }
@@ -104,32 +123,18 @@ static void i2c_drain_data(void) {
 /*
  * START/STOP SM pushes 2-bit words: {SCL, SDA}.
  * When SCL=1 and SDA transitions: START (1→0) or STOP (0→1).
- * We flush any buffered bytes on each START/STOP.
+ * Flush any buffered bytes on each START/STOP, then emit a sentinel.
  */
 static void i2c_drain_events(void) {
-    static uint8_t  byte_buf[FRAME_DATA_MAX];
-    static uint16_t byte_count = 0;
-
-    /* The byte buffer is shared state – we flush on condition boundaries.
-     * For simplicity we flush the current buffer whenever a START arrives
-     * (the previous frame just ended) and when a STOP arrives (this frame
-     * ended). The data SM drives byte_buf via i2c_drain_data so we call
-     * that first on every task iteration (done in pio_monitor_task). */
-
     while (!pio_sm_is_rx_fifo_empty(s_i2c.pio, s_i2c.sm_event)) {
         uint32_t word = pio_sm_get_blocking(s_i2c.pio, s_i2c.sm_event);
         (void)word; /* condition type decoded by C if needed */
 
-        /* Emit a zero-length sentinel frame to mark the event */
-        frame_t frame;
-        frame.timestamp_us = (uint32_t)to_us_since_boot(get_absolute_time());
-        frame.iface  = IFACE_I2C;
-        frame.role   = ROLE_MONITOR;
-        frame.length = 0;
-        deliver_frame(&frame);
+        /* Pull any bytes still sitting in the data FIFO first */
+        i2c_drain_data();
+        flush_buf(IFACE_I2C, s_i2c_buf, &s_i2c_count);
+        emit_sentinel(IFACE_I2C);
     }
-    (void)byte_buf;
-    (void)byte_count;
 }
 
 /* -------------------------------------------------------------------------
@@ -137,59 +142,41 @@ static void i2c_drain_events(void) {
  * ---------------------------------------------------------------------- */
 
 /*
- * Each 16-bit autopush word contains 8 bit-pairs (MOSI bit, MISO bit).
- * We reconstruct separate MOSI and MISO bytes and interleave them:
- *   frame data = [MOSI_byte0, MISO_byte0, MOSI_byte1, MISO_byte1, …]
+ * Each 32-bit autopush word contains 8 nibbles (one per SCK edge).
+ * Within a nibble after shift-left IN PINS,4 from base=MISO:
+ *   bit3=MISO, bit2=CS, bit1=SCK, bit0=MOSI
+ * Frame data = [MOSI_byte0, MISO_byte0, MOSI_byte1, MISO_byte1, …]
  */
 static void spi_drain_data(void) {
-    static uint8_t  byte_buf[FRAME_DATA_MAX];
-    static uint16_t byte_count = 0;
-
     while (!pio_sm_is_rx_fifo_empty(s_spi.pio, s_spi.sm_data)) {
         uint32_t word = pio_sm_get(s_spi.pio, s_spi.sm_data);
-        /*
-         * Autopush at 16 bits, MSB-first shift, so the 16 bits sit in the
-         * top half of the 32-bit word.
-         *   bits[31:16] = captured bits, interleaved: b15=MOSI_b7, b14=MISO_b7, …
-         */
-        uint16_t raw = (uint16_t)(word >> 16);
 
         uint8_t mosi = 0, miso = 0;
         for (int i = 7; i >= 0; i--) {
-            mosi = (uint8_t)((mosi << 1) | ((raw >> (2 * i + 1)) & 1));
-            miso = (uint8_t)((miso << 1) | ((raw >> (2 * i))     & 1));
+            uint8_t nibble = (uint8_t)((word >> (4 * i)) & 0xF);
+            mosi = (uint8_t)((mosi << 1) | (nibble & 1));
+            miso = (uint8_t)((miso << 1) | ((nibble >> 3) & 1));
         }
 
-        if (byte_count + 2 <= FRAME_DATA_MAX) {
-            byte_buf[byte_count++] = mosi;
-            byte_buf[byte_count++] = miso;
+        if (s_spi_count + 2 <= FRAME_DATA_MAX) {
+            s_spi_buf[s_spi_count++] = mosi;
+            s_spi_buf[s_spi_count++] = miso;
         }
 
-        if (byte_count >= FRAME_DATA_MAX - 1) {
-            frame_t frame;
-            frame.timestamp_us = (uint32_t)to_us_since_boot(get_absolute_time());
-            frame.iface  = IFACE_SPI;
-            frame.role   = ROLE_MONITOR;
-            frame.length = byte_count;
-            memcpy(frame.data, byte_buf, byte_count);
-            deliver_frame(&frame);
-            byte_count = 0;
+        if (s_spi_count >= FRAME_DATA_MAX - 1) {
+            flush_buf(IFACE_SPI, s_spi_buf, &s_spi_count);
         }
     }
 }
 
-/* CS events flush the current byte accumulator */
+/* CS events flush the current byte accumulator, then emit a sentinel */
 static void spi_drain_cs(void) {
     while (!pio_sm_is_rx_fifo_empty(s_spi.pio, s_spi.sm_event)) {
         pio_sm_get(s_spi.pio, s_spi.sm_event); /* consume */
 
-        /* Zero-length frame marks a CS edge */
-        frame_t frame;
-        frame.timestamp_us = (uint32_t)to_us_since_boot(get_absolute_time());
-        frame.iface  = IFACE_SPI;
-        frame.role   = ROLE_MONITOR;
-        frame.length = 0;
-        deliver_frame(&frame);
+        spi_drain_data();
+        flush_buf(IFACE_SPI, s_spi_buf, &s_spi_count);
+        emit_sentinel(IFACE_SPI);
     }
 }
 
@@ -199,6 +186,11 @@ static void spi_drain_cs(void) {
 int pio_monitor_init(interface_id_t iface) {
     if (iface == IFACE_I2C) {
         if (s_i2c.active) return 0;  /* already running */
+
+        /* Data SM waits on IN_BASE+1 for SCL – pins must be consecutive */
+        if (I2C_SCL_PIN != I2C_SDA_PIN + 1) {
+            return -1;
+        }
 
         PIO pio = pio0;
 
@@ -225,6 +217,7 @@ int pio_monitor_init(interface_id_t iface) {
         i2c_monitor_startstop_program_init(pio, (uint)sm_event, off_event,
                                            I2C_SDA_PIN);
 
+        s_i2c_count        = 0;
         s_i2c.active       = true;
         s_i2c.pio          = pio;
         s_i2c.sm_data      = (uint)sm_data;
@@ -235,6 +228,16 @@ int pio_monitor_init(interface_id_t iface) {
 
     } else if (iface == IFACE_SPI) {
         if (s_spi.active) return 0;
+
+        /*
+         * Data SM expects a contiguous block:
+         *   RX (MISO), CS, SCK, TX (MOSI)  — Pico spi0 defaults.
+         */
+        if (SPI_CS_PIN  != SPI_RX_PIN + 1 ||
+            SPI_SCK_PIN != SPI_RX_PIN + 2 ||
+            SPI_TX_PIN  != SPI_RX_PIN + 3) {
+            return -1;
+        }
 
         PIO pio = pio1;  /* use pio1 to avoid conflicts with I2C monitor */
 
@@ -255,10 +258,11 @@ int pio_monitor_init(interface_id_t iface) {
         gpio_set_dir(SPI_CS_PIN,  GPIO_IN);
 
         spi_monitor_data_program_init(pio, (uint)sm_data, off_data,
-                                      SPI_RX_PIN, SPI_TX_PIN, SPI_SCK_PIN);
+                                      SPI_RX_PIN, SPI_SCK_PIN, SPI_TX_PIN);
         spi_monitor_cs_program_init(pio, (uint)sm_event, off_event,
                                     SPI_CS_PIN);
 
+        s_spi_count        = 0;
         s_spi.active       = true;
         s_spi.pio          = pio;
         s_spi.sm_data      = (uint)sm_data;
@@ -288,6 +292,12 @@ void pio_monitor_deinit(interface_id_t iface) {
                                 : &spi_monitor_cs_program,
                        s->offset_event);
     s->active = false;
+
+    if (iface == IFACE_I2C) {
+        s_i2c_count = 0;
+    } else {
+        s_spi_count = 0;
+    }
 }
 
 void pio_monitor_task(interface_id_t iface) {

@@ -6,11 +6,11 @@
 ; Works for CPOL=0/CPHA=0 (sample on rising SCK) by default.
 ; The C driver can invert the clock wait condition for other modes.
 ;
-; Pins (in order, assigned at runtime):
-;   pin 0 = MOSI
-;   pin 1 = MISO
-;   pin 2 = SCK
-;   pin 3 = CS (optional – used to frame bytes)
+; Requires a contiguous 4-GPIO block (Pico spi0 defaults):
+;   base+0 = MISO (RX)
+;   base+1 = CS
+;   base+2 = SCK
+;   base+3 = MOSI (TX)
 ;
 ; State machine 0: sample MOSI+MISO on SCK rising edge
 ; State machine 1: CS framing detector
@@ -20,9 +20,9 @@
 ; ---------------------------------------------------------------------------
 .program spi_monitor_data
 .wrap_target
-    wait 0 gpio 2          ; wait SCK low  (pin 2 = SCK)
-    wait 1 gpio 2          ; wait SCK high (rising edge)
-    in   pins, 2           ; sample MOSI(bit0) + MISO(bit1) into ISR
+    wait 0 pin 2           ; wait SCK low  (IN_BASE+2 = SCK)
+    wait 1 pin 2           ; wait SCK high (rising edge)
+    in   pins, 4           ; sample {MISO,CS,SCK,MOSI}; C extracts MISO+MOSI
 .wrap
 
 % c-sdk {
@@ -30,18 +30,22 @@
 
 static inline void spi_monitor_data_program_init(
         PIO pio, uint sm, uint offset,
-        uint mosi_pin, uint miso_pin, uint sck_pin) {
+        uint miso_pin, uint sck_pin, uint mosi_pin) {
     pio_sm_config c = spi_monitor_data_program_get_default_config(offset);
 
-    pio_gpio_init(pio, mosi_pin);
+    /* IN_BASE must be MISO; SCK at +2 and MOSI at +3 (contiguous block). */
+    (void)sck_pin;
+    (void)mosi_pin;
+
     pio_gpio_init(pio, miso_pin);
-    pio_gpio_init(pio, sck_pin);
+    pio_gpio_init(pio, miso_pin + 1);
+    pio_gpio_init(pio, miso_pin + 2);
+    pio_gpio_init(pio, miso_pin + 3);
 
-    /* IN base = mosi_pin; assumes mosi, miso are consecutive */
-    sm_config_set_in_pins(&c, mosi_pin);
+    sm_config_set_in_pins(&c, miso_pin);
 
-    /* Autopush every 16 bits: 8 pairs of (MOSI,MISO) bits = 1 byte each */
-    sm_config_set_in_shift(&c, false, true, 16);
+    /* Autopush every 32 bits: 8 × 4-bit samples = 8 clock edges */
+    sm_config_set_in_shift(&c, false, true, 32);
 
     sm_config_set_clkdiv(&c, 1.0f);
 
@@ -58,10 +62,10 @@ static inline void spi_monitor_data_program_init(
 ; ---------------------------------------------------------------------------
 .program spi_monitor_cs
 .wrap_target
-    wait 0 gpio 3           ; wait for CS low  (frame start)
+    wait 0 pin 0            ; wait for CS low  (IN_BASE = CS)
     in   null, 8            ; push 0x00
     push noblock
-    wait 1 gpio 3           ; wait for CS high (frame end)
+    wait 1 pin 0            ; wait for CS high (frame end)
     in   null, 8            ; push 0xFF temporarily
     ; push 0xFF by inverting: set x 0 / not x / mov isr x
     mov  x, ~null

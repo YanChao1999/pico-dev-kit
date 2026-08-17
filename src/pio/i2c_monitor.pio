@@ -28,8 +28,8 @@
 ; ---------------------------------------------------------------------------
 .program i2c_monitor_data
 .wrap_target
-    wait 0 gpio 1          ; wait for SCL low  (pin 1 = SCL)
-    wait 1 gpio 1          ; wait for SCL high (rising edge)
+    wait 0 pin 1           ; wait for SCL low  (IN_BASE+1 = SCL)
+    wait 1 pin 1           ; wait for SCL high (rising edge)
     in   pins, 1           ; sample SDA into ISR
 .wrap
 

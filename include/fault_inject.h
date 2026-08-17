@@ -62,7 +62,6 @@ typedef struct {
      * how many random bytes are generated.
      */
     bool random_payload;
-    uint16_t post_delay_ms;
 } fault_inject_config_t;
 
 /* -------------------------------------------------------------------------

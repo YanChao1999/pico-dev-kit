@@ -1,0 +1,89 @@
+; spi_monitor.pio
+;
+; Passive SPI bus monitor using PIO.
+;
+; Captures MOSI and MISO simultaneously on every active SCK edge.
+; Works for CPOL=0/CPHA=0 (sample on rising SCK) by default.
+; The C driver can invert the clock wait condition for other modes.
+;
+; Requires a contiguous 4-GPIO block (Pico spi0 defaults):
+;   base+0 = MISO (RX)
+;   base+1 = CS
+;   base+2 = SCK
+;   base+3 = MOSI (TX)
+;
+; State machine 0: sample MOSI+MISO on SCK rising edge
+; State machine 1: CS framing detector
+
+; ---------------------------------------------------------------------------
+; SM0 – sample MOSI and MISO on every SCK rising edge
+; ---------------------------------------------------------------------------
+.program spi_monitor_data
+.wrap_target
+    wait 0 pin 2           ; wait SCK low  (IN_BASE+2 = SCK)
+    wait 1 pin 2           ; wait SCK high (rising edge)
+    in   pins, 4           ; sample {MISO,CS,SCK,MOSI}; C extracts MISO+MOSI
+.wrap
+
+% c-sdk {
+#include "hardware/clocks.h"
+
+static inline void spi_monitor_data_program_init(
+        PIO pio, uint sm, uint offset,
+        uint miso_pin, uint sck_pin, uint mosi_pin) {
+    pio_sm_config c = spi_monitor_data_program_get_default_config(offset);
+
+    /* IN_BASE must be MISO; SCK at +2 and MOSI at +3 (contiguous block). */
+    (void)sck_pin;
+    (void)mosi_pin;
+
+    pio_gpio_init(pio, miso_pin);
+    pio_gpio_init(pio, miso_pin + 1);
+    pio_gpio_init(pio, miso_pin + 2);
+    pio_gpio_init(pio, miso_pin + 3);
+
+    sm_config_set_in_pins(&c, miso_pin);
+
+    /* Autopush every 32 bits: 8 × 4-bit samples = 8 clock edges */
+    sm_config_set_in_shift(&c, false, true, 32);
+
+    sm_config_set_clkdiv(&c, 1.0f);
+
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}
+
+; ---------------------------------------------------------------------------
+; SM1 – CS (chip-select) framing detector
+;
+; Pushes 0x00 when CS goes LOW  (frame start)
+; Pushes 0xFF when CS goes HIGH (frame end)
+; ---------------------------------------------------------------------------
+.program spi_monitor_cs
+.wrap_target
+    wait 0 pin 0            ; wait for CS low  (IN_BASE = CS)
+    in   null, 8            ; push 0x00
+    push noblock
+    wait 1 pin 0            ; wait for CS high (frame end)
+    in   null, 8            ; push 0xFF temporarily
+    ; push 0xFF by inverting: set x 0 / not x / mov isr x
+    mov  x, ~null
+    mov  isr, x
+    push noblock
+.wrap
+
+% c-sdk {
+static inline void spi_monitor_cs_program_init(
+        PIO pio, uint sm, uint offset, uint cs_pin) {
+    pio_sm_config c = spi_monitor_cs_program_get_default_config(offset);
+
+    pio_gpio_init(pio, cs_pin);
+    sm_config_set_in_pins(&c, cs_pin);
+    sm_config_set_in_shift(&c, false, false, 32);
+    sm_config_set_clkdiv(&c, 1.0f);
+
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}

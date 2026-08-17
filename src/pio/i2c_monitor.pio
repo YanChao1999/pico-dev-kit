@@ -1,0 +1,100 @@
+; i2c_monitor.pio
+;
+; Passive I2C bus monitor using PIO.
+;
+; Pins (in order):
+;   pin 0 = SDA (input)
+;   pin 1 = SCL (input)
+;
+; The program samples SDA on every rising edge of SCL and shifts the bit into
+; the ISR.  After 8 bits a byte is pushed to the RX FIFO together with a
+; "NACK/ACK" bit (the 9th SCL pulse).
+;
+; The host C code detects START and STOP conditions by watching the jmp_pin
+; side-set so we use a separate state machine for START/STOP detection.
+;
+; State machine 0: byte sampler
+; State machine 1: START / STOP detector
+;
+; SM0 uses:
+;   IN  pins: SDA (base pin)
+;   JMP pin:  SCL
+;
+; SM1 uses:
+;   IN  pins: SDA (base pin), SCL (base+1)
+
+; ---------------------------------------------------------------------------
+; SM0 – sample 8 data bits + 1 ACK bit on every SCL rising edge
+; ---------------------------------------------------------------------------
+.program i2c_monitor_data
+.wrap_target
+    wait 0 pin 1           ; wait for SCL low  (IN_BASE+1 = SCL)
+    wait 1 pin 1           ; wait for SCL high (rising edge)
+    in   pins, 1           ; sample SDA into ISR
+.wrap
+
+% c-sdk {
+#include "hardware/clocks.h"
+
+static inline void i2c_monitor_data_program_init(
+        PIO pio, uint sm, uint offset, uint sda_pin) {
+    pio_sm_config c = i2c_monitor_data_program_get_default_config(offset);
+
+    /* Both SDA and SCL are pure inputs – no direction set */
+    pio_gpio_init(pio, sda_pin);
+    pio_gpio_init(pio, sda_pin + 1);   /* SCL = SDA + 1 */
+
+    sm_config_set_in_pins(&c, sda_pin);
+    sm_config_set_jmp_pin(&c, sda_pin + 1);  /* SCL */
+
+    /* Shift in LSB-first, autopush every 9 bits (8 data + 1 ACK) */
+    sm_config_set_in_shift(&c, false, true, 9);
+
+    /* Run at system clock – tight polling is fine for I2C ≤ 1 MHz */
+    sm_config_set_clkdiv(&c, 1.0f);
+
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}
+
+; ---------------------------------------------------------------------------
+; SM1 – START / STOP condition detector
+;
+; I2C START: SDA falls while SCL is HIGH  → push 0x01 to FIFO
+; I2C STOP : SDA rises while SCL is HIGH  → push 0x02 to FIFO
+;
+; Algorithm: sample SDA repeatedly; on any change while SCL=1 report event.
+; ---------------------------------------------------------------------------
+.program i2c_monitor_startstop
+.wrap_target
+    mov  osr, pins          ; snapshot SDA+SCL into OSR (for previous state)
+top:
+    mov  x, pins            ; x = current {SCL,SDA} (2-bit)
+    jmp  x!=y, change       ; if changed, handle it
+    jmp  top                ; else loop
+change:
+    mov  y, x               ; update previous state
+    ; Only care about transitions when SCL is high (bit 1 of x)
+    ; We push x as-is; the C side interprets {SCL_prev, SDA_prev, SCL, SDA}
+    in   x, 2               ; push 2-bit snapshot
+    push noblock
+.wrap
+
+% c-sdk {
+static inline void i2c_monitor_startstop_program_init(
+        PIO pio, uint sm, uint offset, uint sda_pin) {
+    pio_sm_config c = i2c_monitor_startstop_program_get_default_config(offset);
+
+    pio_gpio_init(pio, sda_pin);
+    pio_gpio_init(pio, sda_pin + 1);
+
+    sm_config_set_in_pins(&c, sda_pin);   /* {SDA, SCL} from base */
+    sm_config_set_in_shift(&c, false, false, 32);
+
+    sm_config_set_clkdiv(&c, 1.0f);
+
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}

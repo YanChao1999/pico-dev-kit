@@ -53,3 +53,12 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# CMake build directory
+build/
+
+# Pico firmware binaries
+*.uf2
+*.bin
+*.dis
+

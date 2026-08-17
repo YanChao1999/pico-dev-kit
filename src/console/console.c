@@ -10,6 +10,7 @@
 #include "recorder.h"
 #include "fault_inject.h"
 #include "monitor.h"
+#include "pio_monitor.h"
 #include "pico_dev_kit.h"
 #include <string.h>
 #include <stdlib.h>
@@ -65,12 +66,13 @@ static void cmd_help(void) {
         "  help\r\n"
         "  version\r\n"
         "  status\r\n"
-        "  config i2c  master|slave <speed_kHz>\r\n"
-        "  config spi  master|slave <speed_kHz> <cpol> <cpha>\r\n"
+        "  config i2c  master|slave|monitor [speed_kHz]\r\n"
+        "  config spi  master|slave|monitor [speed_kHz] [cpol] [cpha]\r\n"
         "  record start|stop\r\n"
         "  inject i2c <addr_hex> <byte0> [byte1 …]\r\n"
         "  inject spi  <byte0> [byte1 …]\r\n"
         "  monitor start|stop\r\n"
+        "\r\nIn monitor mode the PIO passively sniffs the bus without driving any lines.\r\n"
         "\r\n");
 }
 
@@ -98,34 +100,54 @@ static void cmd_config(char **argv, int argc) {
     if (argc < 3) { usb_console_write("Usage: config i2c|spi ...\r\n"); return; }
 
     if (strcmp(argv[1], "i2c") == 0) {
-        if (argc < 4) {
-            usb_console_write("Usage: config i2c master|slave <speed_kHz>\r\n");
+        if (argc < 3) {
+            usb_console_write("Usage: config i2c master|slave|monitor [speed_kHz]\r\n");
             return;
         }
-        interface_role_t role = (strcmp(argv[2], "slave") == 0) ? ROLE_SLAVE : ROLE_MASTER;
-        uint32_t speed = (uint32_t)atoi(argv[3]);
+        interface_role_t role;
+        if (strcmp(argv[2], "slave") == 0)        role = ROLE_SLAVE;
+        else if (strcmp(argv[2], "monitor") == 0) role = ROLE_MONITOR;
+        else                                       role = ROLE_MASTER;
+
+        uint32_t speed = (argc > 3) ? (uint32_t)atoi(argv[3]) : 0;
         if (speed == 0) speed = 100;
+
         i2c_interface_deinit();
         i2c_interface_init(role, speed);
-        usb_console_printf("I2C configured: %s @ %lukHz\r\n",
-                           role == ROLE_MASTER ? "master" : "slave",
-                           (unsigned long)speed);
+
+        if (role == ROLE_MONITOR) {
+            usb_console_write("I2C configured: monitor (PIO passive sniff)\r\n");
+        } else {
+            usb_console_printf("I2C configured: %s @ %lukHz\r\n",
+                               role == ROLE_MASTER ? "master" : "slave",
+                               (unsigned long)speed);
+        }
 
     } else if (strcmp(argv[1], "spi") == 0) {
-        if (argc < 4) {
-            usb_console_write("Usage: config spi master|slave <speed_kHz> [cpol] [cpha]\r\n");
+        if (argc < 3) {
+            usb_console_write("Usage: config spi master|slave|monitor [speed_kHz] [cpol] [cpha]\r\n");
             return;
         }
-        interface_role_t role = (strcmp(argv[2], "slave") == 0) ? ROLE_SLAVE : ROLE_MASTER;
-        uint32_t speed = (uint32_t)atoi(argv[3]);
+        interface_role_t role;
+        if (strcmp(argv[2], "slave") == 0)        role = ROLE_SLAVE;
+        else if (strcmp(argv[2], "monitor") == 0) role = ROLE_MONITOR;
+        else                                       role = ROLE_MASTER;
+
+        uint32_t speed = (argc > 3) ? (uint32_t)atoi(argv[3]) : 0;
         uint8_t cpol = (argc > 4) ? (uint8_t)atoi(argv[4]) : 0;
         uint8_t cpha = (argc > 5) ? (uint8_t)atoi(argv[5]) : 0;
         if (speed == 0) speed = 1000;
+
         spi_interface_deinit();
         spi_interface_init(role, speed, cpol, cpha);
-        usb_console_printf("SPI configured: %s @ %lukHz cpol=%d cpha=%d\r\n",
-                           role == ROLE_MASTER ? "master" : "slave",
-                           (unsigned long)speed, cpol, cpha);
+
+        if (role == ROLE_MONITOR) {
+            usb_console_write("SPI configured: monitor (PIO passive sniff)\r\n");
+        } else {
+            usb_console_printf("SPI configured: %s @ %lukHz cpol=%d cpha=%d\r\n",
+                               role == ROLE_MASTER ? "master" : "slave",
+                               (unsigned long)speed, cpol, cpha);
+        }
     } else {
         usb_console_write("Unknown interface. Use i2c or spi.\r\n");
     }

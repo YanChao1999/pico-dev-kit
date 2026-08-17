@@ -6,6 +6,7 @@
 #include "i2c_interface.h"
 #include "recorder.h"
 #include "monitor.h"
+#include "pio_monitor.h"
 #include "usb_transport.h"
 #include "hardware/i2c.h"
 #include "hardware/gpio.h"
@@ -62,6 +63,16 @@ void i2c_interface_init(interface_role_t role, uint32_t speed_khz) {
     s_slave_len = 0;
     s_slave_frame_ready = false;
 
+    if (role == ROLE_MONITOR) {
+        /* PIO-based passive sniff: pins are plain GPIO inputs */
+        gpio_set_function(I2C_SDA_PIN, GPIO_FUNC_SIO);
+        gpio_set_function(I2C_SCL_PIN, GPIO_FUNC_SIO);
+        gpio_set_dir(I2C_SDA_PIN, GPIO_IN);
+        gpio_set_dir(I2C_SCL_PIN, GPIO_IN);
+        pio_monitor_init(IFACE_I2C);
+        return;
+    }
+
     gpio_set_function(I2C_SDA_PIN, GPIO_FUNC_I2C);
     gpio_set_function(I2C_SCL_PIN, GPIO_FUNC_I2C);
     gpio_pull_up(I2C_SDA_PIN);
@@ -84,6 +95,13 @@ void i2c_interface_init(interface_role_t role, uint32_t speed_khz) {
 
 void i2c_interface_deinit(void) {
     if (!s_active) return;
+    if (s_role == ROLE_MONITOR) {
+        pio_monitor_deinit(IFACE_I2C);
+        gpio_set_function(I2C_SDA_PIN, GPIO_FUNC_NULL);
+        gpio_set_function(I2C_SCL_PIN, GPIO_FUNC_NULL);
+        s_active = false;
+        return;
+    }
     if (s_role == ROLE_SLAVE) {
         irq_set_enabled(I2C0_IRQ, false);
     }
@@ -136,7 +154,14 @@ int i2c_master_read(uint8_t addr, uint8_t *data, size_t len) {
 }
 
 void i2c_interface_task(void) {
-    if (!s_active || s_role != ROLE_SLAVE) return;
+    if (!s_active) return;
+
+    if (s_role == ROLE_MONITOR) {
+        pio_monitor_task(IFACE_I2C);
+        return;
+    }
+
+    if (s_role != ROLE_SLAVE) return;
 
     if (s_slave_frame_ready) {
         /* Snapshot atomically */

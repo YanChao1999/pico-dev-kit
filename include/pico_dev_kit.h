@@ -5,8 +5,8 @@
  * Raspberry Pi Pico multi-interface development kit.
  * Features:
  *   - USB CDC console for runtime configuration
- *   - I2C master / slave
- *   - SPI master / slave
+ *   - I2C master / slave / monitor (PIO)
+ *   - SPI master / slave / monitor (PIO)
  *   - Frame recorder (capture and stream to USB host)
  *   - Fault injection
  *   - Interface monitor / health check
@@ -39,8 +39,9 @@ typedef enum {
  * Interface role
  * ---------------------------------------------------------------------- */
 typedef enum {
-    ROLE_MASTER = 0,
-    ROLE_SLAVE  = 1,
+    ROLE_MASTER  = 0,
+    ROLE_SLAVE   = 1,
+    ROLE_MONITOR = 2,   /* passive PIO-based sniff (no driving of bus lines) */
 } interface_role_t;
 
 /* -------------------------------------------------------------------------

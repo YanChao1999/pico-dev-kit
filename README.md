@@ -10,8 +10,8 @@ monitoring.
 |---|---|
 | **USB Console** | CDC ACM port 0 – interactive text commands |
 | **USB Data Stream** | CDC ACM port 1 – binary frame stream to host |
-| **I2C master/slave** | Configurable speed; slave driven by hardware IRQ |
-| **SPI master/slave** | Configurable speed, CPOL, CPHA; slave via DMA |
+| **I2C master/slave/monitor** | Configurable speed; slave via hardware IRQ; monitor via PIO (passive sniff) |
+| **SPI master/slave/monitor** | Configurable speed, CPOL, CPHA; slave via DMA; monitor via PIO (passive sniff) |
 | **Frame recorder** | Captures all traffic and streams it over USB data port |
 | **Fault injection** | Send arbitrary byte sequences on any interface |
 | **Interface monitor** | Periodic health checks; logs errors to console |
@@ -22,13 +22,24 @@ monitoring.
 help
 version
 status
-config i2c  master|slave <speed_kHz>
-config spi  master|slave <speed_kHz> [cpol] [cpha]
+config i2c  master|slave|monitor [speed_kHz]
+config spi  master|slave|monitor [speed_kHz] [cpol] [cpha]
 record start|stop
 inject i2c <addr_hex> <byte0> [byte1 …]
 inject spi  <byte0> [byte1 …]
 monitor start|stop
 ```
+
+In **monitor** mode the Pico never drives the bus lines.  Two PIO state
+machines sniff traffic passively and push decoded frames to the recorder.
+
+- **I2C monitor**: SM0 samples SDA on every SCL rising edge (9-bit words:
+  8 data + 1 ACK); SM1 detects START/STOP conditions.
+- **SPI monitor**: SM0 samples MOSI+MISO on every SCK rising edge; SM1
+  tracks CS to delimit frames.
+
+Monitor mode records `role=2` frames which the host decoder can distinguish
+from master/slave frames.
 
 ## USB data-port frame format
 
@@ -38,9 +49,11 @@ Each captured frame is sent as a binary packet on CDC port 1:
 [4]  magic       0x50 0x44 0x4B 0x46  ("PDKF")
 [4]  timestamp   microseconds since boot (little-endian uint32)
 [1]  iface       1=I2C  2=SPI
-[1]  role        0=master  1=slave
+[1]  role        0=master  1=slave  2=monitor (PIO passive sniff)
 [2]  length      payload byte count (little-endian uint16)
 [N]  data        captured bytes
+               SPI monitor: interleaved [MOSI_byte, MISO_byte, …]
+               length=0 frames mark START/STOP (I2C) or CS edges (SPI)
 ```
 
 ## Building

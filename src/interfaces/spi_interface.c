@@ -6,6 +6,7 @@
 #include "spi_interface.h"
 #include "recorder.h"
 #include "monitor.h"
+#include "pio_monitor.h"
 #include "hardware/spi.h"
 #include "hardware/gpio.h"
 #include "hardware/dma.h"
@@ -55,6 +56,20 @@ void spi_interface_init(interface_role_t role, uint32_t speed_khz,
     s_role   = role;
     s_active = true;
 
+    if (role == ROLE_MONITOR) {
+        /* PIO-based passive sniff: all pins are plain GPIO inputs */
+        gpio_set_function(SPI_SCK_PIN, GPIO_FUNC_SIO);
+        gpio_set_function(SPI_TX_PIN,  GPIO_FUNC_SIO);
+        gpio_set_function(SPI_RX_PIN,  GPIO_FUNC_SIO);
+        gpio_set_function(SPI_CS_PIN,  GPIO_FUNC_SIO);
+        gpio_set_dir(SPI_SCK_PIN, GPIO_IN);
+        gpio_set_dir(SPI_TX_PIN,  GPIO_IN);
+        gpio_set_dir(SPI_RX_PIN,  GPIO_IN);
+        gpio_set_dir(SPI_CS_PIN,  GPIO_IN);
+        pio_monitor_init(IFACE_SPI);
+        return;
+    }
+
     gpio_set_function(SPI_SCK_PIN, GPIO_FUNC_SPI);
     gpio_set_function(SPI_TX_PIN,  GPIO_FUNC_SPI);
     gpio_set_function(SPI_RX_PIN,  GPIO_FUNC_SPI);
@@ -81,6 +96,15 @@ void spi_interface_init(interface_role_t role, uint32_t speed_khz,
 
 void spi_interface_deinit(void) {
     if (!s_active) return;
+    if (s_role == ROLE_MONITOR) {
+        pio_monitor_deinit(IFACE_SPI);
+        gpio_set_function(SPI_SCK_PIN, GPIO_FUNC_NULL);
+        gpio_set_function(SPI_TX_PIN,  GPIO_FUNC_NULL);
+        gpio_set_function(SPI_RX_PIN,  GPIO_FUNC_NULL);
+        gpio_set_function(SPI_CS_PIN,  GPIO_FUNC_NULL);
+        s_active = false;
+        return;
+    }
     if (s_slave_dma_chan >= 0) {
         dma_channel_abort(s_slave_dma_chan);
         dma_channel_unclaim(s_slave_dma_chan);
@@ -127,7 +151,14 @@ int spi_master_transfer(const uint8_t *tx_data, uint8_t *rx_data, size_t len) {
 }
 
 void spi_interface_task(void) {
-    if (!s_active || s_role != ROLE_SLAVE) return;
+    if (!s_active) return;
+
+    if (s_role == ROLE_MONITOR) {
+        pio_monitor_task(IFACE_SPI);
+        return;
+    }
+
+    if (s_role != ROLE_SLAVE) return;
     if (s_slave_dma_chan < 0) return;
 
     /* Check how many bytes the DMA has written so far */

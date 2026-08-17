@@ -9,6 +9,14 @@ set(CMAKE_CXX_STANDARD 17)
 
 pico_sdk_init()
 
+# Generate PIO headers from .pio source files
+pico_generate_pio_header(pico_dev_kit
+    ${CMAKE_CURRENT_LIST_DIR}/src/pio/i2c_monitor.pio
+)
+pico_generate_pio_header(pico_dev_kit
+    ${CMAKE_CURRENT_LIST_DIR}/src/pio/spi_monitor.pio
+)
+
 add_executable(pico_dev_kit
     src/main.c
     src/usb/usb_transport.c
@@ -19,6 +27,7 @@ add_executable(pico_dev_kit
     src/recorder/recorder.c
     src/fault_inject/fault_inject.c
     src/monitor/monitor.c
+    src/pio/pio_monitor.c
 )
 
 target_include_directories(pico_dev_kit PRIVATE
@@ -33,6 +42,7 @@ target_link_libraries(pico_dev_kit
     hardware_gpio
     hardware_timer
     hardware_dma
+    hardware_pio
     tinyusb_device
     tinyusb_board
 )

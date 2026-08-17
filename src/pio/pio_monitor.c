@@ -41,6 +41,19 @@ typedef struct {
 static pio_mon_state_t s_i2c;
 static pio_mon_state_t s_spi;
 
+/* Optional callback invoked for every decoded frame (before recorder push) */
+static void (*s_frame_cb)(const frame_t *) = NULL;
+
+/* -------------------------------------------------------------------------
+ * Internal helper: deliver a decoded frame to callback + recorder
+ * ---------------------------------------------------------------------- */
+static void deliver_frame(const frame_t *f) {
+    if (s_frame_cb) {
+        s_frame_cb(f);
+    }
+    recorder_push(f);
+}
+
 /* -------------------------------------------------------------------------
  * I2C monitor helpers
  * ---------------------------------------------------------------------- */
@@ -82,7 +95,7 @@ static void i2c_drain_data(void) {
             frame.role   = ROLE_MONITOR;
             frame.length = byte_count;
             memcpy(frame.data, byte_buf, byte_count);
-            recorder_push(&frame);
+            deliver_frame(&frame);
             byte_count = 0;
         }
     }
@@ -113,7 +126,7 @@ static void i2c_drain_events(void) {
         frame.iface  = IFACE_I2C;
         frame.role   = ROLE_MONITOR;
         frame.length = 0;
-        recorder_push(&frame);
+        deliver_frame(&frame);
     }
     (void)byte_buf;
     (void)byte_count;
@@ -159,7 +172,7 @@ static void spi_drain_data(void) {
             frame.role   = ROLE_MONITOR;
             frame.length = byte_count;
             memcpy(frame.data, byte_buf, byte_count);
-            recorder_push(&frame);
+            deliver_frame(&frame);
             byte_count = 0;
         }
     }
@@ -176,7 +189,7 @@ static void spi_drain_cs(void) {
         frame.iface  = IFACE_SPI;
         frame.role   = ROLE_MONITOR;
         frame.length = 0;
-        recorder_push(&frame);
+        deliver_frame(&frame);
     }
 }
 
@@ -289,4 +302,8 @@ void pio_monitor_task(interface_id_t iface) {
 
 bool pio_monitor_is_active(interface_id_t iface) {
     return (iface == IFACE_I2C) ? s_i2c.active : s_spi.active;
+}
+
+void pio_monitor_set_frame_callback(void (*cb)(const frame_t *frame)) {
+    s_frame_cb = cb;
 }

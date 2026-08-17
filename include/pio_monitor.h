@@ -39,12 +39,25 @@ int pio_monitor_init(interface_id_t iface);
 void pio_monitor_deinit(interface_id_t iface);
 
 /**
- * Drain PIO FIFOs and push decoded frames to the recorder.
+ * Drain PIO FIFOs and push decoded frames to the recorder (and to any
+ * registered frame callback).
  * Must be called from the main loop.
  */
 void pio_monitor_task(interface_id_t iface);
 
 /** Return true if the given interface's PIO monitor is active. */
 bool pio_monitor_is_active(interface_id_t iface);
+
+/**
+ * Register a callback invoked for every decoded frame before it is pushed
+ * to the recorder.  Pass NULL to deregister.
+ *
+ * The callback is called from the main-loop context (not from an ISR).
+ * Only one callback may be registered at a time; a second call replaces the
+ * previous registration.
+ *
+ * @param cb  Function receiving a pointer to the decoded frame, or NULL.
+ */
+void pio_monitor_set_frame_callback(void (*cb)(const frame_t *frame));
 
 #endif /* PIO_MONITOR_H */

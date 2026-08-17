@@ -26,6 +26,7 @@ add_executable(pico_dev_kit
     src/interfaces/spi_interface.c
     src/recorder/recorder.c
     src/fault_inject/fault_inject.c
+    src/fault_inject/fault_inject_trigger.c
     src/monitor/monitor.c
     src/pio/pio_monitor.c
 )

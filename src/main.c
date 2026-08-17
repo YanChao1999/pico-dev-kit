@@ -10,6 +10,7 @@
 #include "spi_interface.h"
 #include "recorder.h"
 #include "fault_inject.h"
+#include "fault_inject_trigger.h"
 #include "monitor.h"
 
 int main(void) {
@@ -25,6 +26,7 @@ int main(void) {
     /* Initialise application modules. */
     recorder_init();
     fault_inject_init();
+    fault_inject_trigger_init();
     monitor_init();
     console_init();
 
@@ -36,6 +38,7 @@ int main(void) {
         spi_interface_task();
         recorder_task();
         monitor_task();
+        fault_inject_trigger_task();
     }
 
     return 0;

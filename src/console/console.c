@@ -9,6 +9,7 @@
 #include "spi_interface.h"
 #include "recorder.h"
 #include "fault_inject.h"
+#include "fault_inject_trigger.h"
 #include "monitor.h"
 #include "pio_monitor.h"
 #include "pico_dev_kit.h"
@@ -20,7 +21,7 @@
  * Input line buffer
  * ---------------------------------------------------------------------- */
 #define LINE_BUF_SIZE  128
-#define MAX_ARGS        16
+#define MAX_ARGS        32
 
 static char  s_line[LINE_BUF_SIZE];
 static int   s_line_pos;
@@ -69,8 +70,13 @@ static void cmd_help(void) {
         "  config i2c  master|slave|monitor [speed_kHz]\r\n"
         "  config spi  master|slave|monitor [speed_kHz] [cpol] [cpha]\r\n"
         "  record start|stop\r\n"
-        "  inject i2c <addr_hex> <byte0> [byte1 …]\r\n"
-        "  inject spi  <byte0> [byte1 …]\r\n"
+        "  inject i2c <addr_hex> <byte0> [byte1 …] [repeat N] [delay MS] [flip MASK]\r\n"
+        "  inject spi  <byte0> [byte1 …]              [repeat N] [delay MS] [flip MASK]\r\n"
+        "  inject config [repeat N] [delay MS] [flip MASK] [pre MS] [post MS]\r\n"
+        "  inject config show\r\n"
+        "  inject trigger set i2c|spi pattern <hex…> payload <hex…> [addr HH] [once]\r\n"
+        "  inject trigger disarm\r\n"
+        "  inject trigger show\r\n"
         "  monitor start|stop\r\n"
         "\r\nIn monitor mode the PIO passively sniffs the bus without driving any lines.\r\n"
         "\r\n");
@@ -86,6 +92,10 @@ static void cmd_version(void) {
 static void cmd_status(void) {
     usb_console_printf("I2C   : %s\r\n", i2c_interface_is_active() ? "active" : "idle");
     usb_console_printf("SPI   : %s\r\n", spi_interface_is_active() ? "active" : "idle");
+    usb_console_printf("PIO monitor I2C: %s\r\n",
+                       pio_monitor_is_active(IFACE_I2C) ? "active" : "inactive");
+    usb_console_printf("PIO monitor SPI: %s\r\n",
+                       pio_monitor_is_active(IFACE_SPI) ? "active" : "inactive");
     usb_console_printf("Record: %s  frames=%lu\r\n",
                        recorder_is_active() ? "on" : "off",
                        (unsigned long)recorder_frame_count());
@@ -94,6 +104,27 @@ static void cmd_status(void) {
                        (unsigned long)monitor_error_count());
     usb_console_printf("Inject count: %lu\r\n",
                        (unsigned long)fault_inject_count());
+
+    fault_inject_config_t cfg;
+    fault_inject_get_config(&cfg);
+    usb_console_printf("Inject config: repeat=%u delay=%ums flip=0x%02X"
+                       " offset=%u pre=%ums post=%ums\r\n",
+                       cfg.repeat, cfg.repeat_delay_ms, cfg.bit_flip_mask,
+                       cfg.byte_offset, cfg.pre_delay_ms, cfg.post_delay_ms);
+
+    usb_console_printf("Trigger: %s  matches=%lu\r\n",
+                       fault_inject_trigger_is_armed() ? "armed" : "disarmed",
+                       (unsigned long)fault_inject_trigger_match_count());
+    if (fault_inject_trigger_is_armed()) {
+        fault_inject_trigger_config_t tcfg;
+        fault_inject_trigger_get_config(&tcfg);
+        usb_console_printf("  watch=%s action=%s pattern_len=%u"
+                           " payload_len=%u one_shot=%s\r\n",
+                           tcfg.iface == IFACE_I2C ? "i2c" : "spi",
+                           tcfg.action_iface == IFACE_I2C ? "i2c" : "spi",
+                           tcfg.pattern_len, tcfg.payload_len,
+                           tcfg.one_shot ? "yes" : "no");
+    }
 }
 
 static void cmd_config(char **argv, int argc) {
@@ -167,38 +198,314 @@ static void cmd_record(char **argv, int argc) {
     }
 }
 
-static void cmd_inject(char **argv, int argc) {
+/* -------------------------------------------------------------------------
+ * Keyword-argument parsing helpers for the inject command
+ *
+ * These scan argv[start..argc-1] for "keyword value" pairs and return the
+ * first argument index that does not look like a data hex byte.
+ * ---------------------------------------------------------------------- */
+
+/* Return index of the first argv[i] (starting at *pos) that equals keyword,
+ * or -1 if not found.  If found, advances *pos past the value. */
+static int find_kwarg(char **argv, int argc, int start,
+                      const char *keyword, char **value_out) {
+    for (int i = start; i < argc - 1; i++) {
+        if (strcmp(argv[i], keyword) == 0) {
+            *value_out = argv[i + 1];
+            return i;
+        }
+    }
+    return -1;
+}
+
+/*
+ * Collect hex data bytes from argv[start] until a non-hex token or a
+ * recognised keyword is encountered.  Returns count of bytes consumed.
+ */
+static const char *s_inject_keywords[] = {
+    "repeat", "delay", "flip", "pre", "post",
+    "pattern", "payload", "addr", "once",
+    NULL
+};
+
+static bool is_inject_keyword(const char *s) {
+    for (int i = 0; s_inject_keywords[i]; i++) {
+        if (strcmp(s, s_inject_keywords[i]) == 0) return true;
+    }
+    return false;
+}
+
+static int collect_hex_bytes(char **argv, int argc, int start,
+                              uint8_t *out, size_t max) {
+    int n = 0;
+    for (int i = start; i < argc && (size_t)n < max; i++) {
+        if (is_inject_keyword(argv[i])) break;
+        char *end;
+        unsigned long v = strtoul(argv[i], &end, 16);
+        if (end == argv[i] || v > 0xFF) return -1;
+        out[n++] = (uint8_t)v;
+    }
+    return n;
+}
+
+/* -------------------------------------------------------------------------
+ * inject config sub-command
+ * ---------------------------------------------------------------------- */
+static void cmd_inject_config(char **argv, int argc) {
+    /* argv[0]="inject" argv[1]="config" argv[2..] = options */
+    if (argc >= 3 && strcmp(argv[2], "show") == 0) {
+        fault_inject_config_t cfg;
+        fault_inject_get_config(&cfg);
+        usb_console_printf("inject config: repeat=%u delay=%ums flip=0x%02X"
+                           " offset=%u pre=%ums post=%ums\r\n",
+                           cfg.repeat, cfg.repeat_delay_ms, cfg.bit_flip_mask,
+                           cfg.byte_offset, cfg.pre_delay_ms, cfg.post_delay_ms);
+        return;
+    }
+
+    fault_inject_config_t cfg;
+    fault_inject_get_config(&cfg);
+
+    char *val;
+    if (find_kwarg(argv, argc, 2, "repeat", &val) >= 0)
+        cfg.repeat = (uint16_t)atoi(val);
+    if (find_kwarg(argv, argc, 2, "delay", &val) >= 0)
+        cfg.repeat_delay_ms = (uint16_t)atoi(val);
+    if (find_kwarg(argv, argc, 2, "flip", &val) >= 0)
+        cfg.bit_flip_mask = (uint8_t)strtoul(val, NULL, 16);
+    if (find_kwarg(argv, argc, 2, "offset", &val) >= 0)
+        cfg.byte_offset = (uint16_t)atoi(val);
+    if (find_kwarg(argv, argc, 2, "pre", &val) >= 0)
+        cfg.pre_delay_ms = (uint16_t)atoi(val);
+    if (find_kwarg(argv, argc, 2, "post", &val) >= 0)
+        cfg.post_delay_ms = (uint16_t)atoi(val);
+
+    fault_inject_configure(&cfg);
+    usb_console_printf("inject config updated: repeat=%u delay=%ums flip=0x%02X"
+                       " offset=%u pre=%ums post=%ums\r\n",
+                       cfg.repeat, cfg.repeat_delay_ms, cfg.bit_flip_mask,
+                       cfg.byte_offset, cfg.pre_delay_ms, cfg.post_delay_ms);
+}
+
+/* -------------------------------------------------------------------------
+ * inject trigger sub-command
+ * ---------------------------------------------------------------------- */
+static void cmd_inject_trigger(char **argv, int argc) {
+    /* argv[0]="inject" argv[1]="trigger" argv[2]= set|disarm|show */
     if (argc < 3) {
-        usb_console_write("Usage: inject i2c <addr_hex> <byte…>\r\n"
-                          "       inject spi <byte…>\r\n");
+        usb_console_write("Usage: inject trigger set|disarm|show\r\n");
+        return;
+    }
+
+    if (strcmp(argv[2], "disarm") == 0) {
+        fault_inject_trigger_disarm();
+        usb_console_write("Trigger disarmed.\r\n");
+        return;
+    }
+
+    if (strcmp(argv[2], "show") == 0) {
+        usb_console_printf("Trigger: %s  matches=%lu\r\n",
+                           fault_inject_trigger_is_armed() ? "armed" : "disarmed",
+                           (unsigned long)fault_inject_trigger_match_count());
+        if (fault_inject_trigger_is_armed()) {
+            fault_inject_trigger_config_t tcfg;
+            fault_inject_trigger_get_config(&tcfg);
+
+            /* Print pattern bytes */
+            usb_console_printf("  watch=%s  pattern(%u):",
+                               tcfg.iface == IFACE_I2C ? "i2c" : "spi",
+                               tcfg.pattern_len);
+            for (uint16_t i = 0; i < tcfg.pattern_len; i++) {
+                usb_console_printf(" %02X", tcfg.pattern[i]);
+            }
+            usb_console_write("\r\n");
+
+            /* Print payload bytes */
+            usb_console_printf("  action=%s  payload(%u):",
+                               tcfg.action_iface == IFACE_I2C ? "i2c" : "spi",
+                               tcfg.payload_len);
+            for (uint16_t i = 0; i < tcfg.payload_len; i++) {
+                usb_console_printf(" %02X", tcfg.payload[i]);
+            }
+            usb_console_write("\r\n");
+
+            if (tcfg.action_iface == IFACE_I2C) {
+                usb_console_printf("  addr=0x%02X\r\n", tcfg.addr);
+            }
+            usb_console_printf("  match_offset=%u  one_shot=%s\r\n",
+                               tcfg.match_offset,
+                               tcfg.one_shot ? "yes" : "no");
+        }
+        return;
+    }
+
+    if (strcmp(argv[2], "set") != 0 || argc < 4) {
+        usb_console_write("Usage: inject trigger set i2c|spi pattern <hex…>"
+                          " payload <hex…> [addr HH] [once]\r\n");
+        return;
+    }
+
+    /* argv[3] = watch interface */
+    fault_inject_trigger_config_t tcfg;
+    memset(&tcfg, 0, sizeof(tcfg));
+
+    if (strcmp(argv[3], "i2c") == 0)      tcfg.iface = IFACE_I2C;
+    else if (strcmp(argv[3], "spi") == 0) tcfg.iface = IFACE_SPI;
+    else {
+        usb_console_write("Unknown interface. Use i2c or spi.\r\n");
+        return;
+    }
+
+    /* Default: inject on the same interface as the watch */
+    tcfg.action_iface = tcfg.iface;
+
+    /* Find "pattern" keyword and collect bytes until next keyword */
+    char *dummy;
+    int pat_idx = find_kwarg(argv, argc, 4, "pattern", &dummy);
+    if (pat_idx < 0) {
+        usb_console_write("Missing 'pattern' keyword.\r\n");
+        return;
+    }
+    int n = collect_hex_bytes(argv, argc, pat_idx + 1,
+                              tcfg.pattern, FRAME_DATA_MAX);
+    if (n <= 0) {
+        usb_console_write("No valid pattern bytes.\r\n");
+        return;
+    }
+    tcfg.pattern_len = (uint16_t)n;
+
+    /* Find "payload" keyword and collect bytes */
+    int pay_idx = find_kwarg(argv, argc, 4, "payload", &dummy);
+    if (pay_idx < 0) {
+        usb_console_write("Missing 'payload' keyword.\r\n");
+        return;
+    }
+    n = collect_hex_bytes(argv, argc, pay_idx + 1,
+                          tcfg.payload, FRAME_DATA_MAX);
+    if (n <= 0) {
+        usb_console_write("No valid payload bytes.\r\n");
+        return;
+    }
+    tcfg.payload_len = (uint16_t)n;
+
+    /* Optional: addr */
+    char *val;
+    if (find_kwarg(argv, argc, 4, "addr", &val) >= 0) {
+        unsigned long a = strtoul(val, NULL, 16);
+        if (a > 0x7F) {
+            usb_console_write("Invalid I2C address.\r\n");
+            return;
+        }
+        tcfg.addr = (uint8_t)a;
+        tcfg.action_iface = IFACE_I2C;
+    }
+
+    /* Optional: offset */
+    if (find_kwarg(argv, argc, 4, "offset", &val) >= 0) {
+        tcfg.match_offset = (uint16_t)atoi(val);
+    }
+
+    /* Optional: once */
+    for (int i = 4; i < argc; i++) {
+        if (strcmp(argv[i], "once") == 0) {
+            tcfg.one_shot = true;
+            break;
+        }
+    }
+
+    fault_inject_trigger_set(&tcfg);
+    usb_console_printf("Trigger armed: watch=%s pattern_len=%u"
+                       " action=%s payload_len=%u one_shot=%s\r\n",
+                       tcfg.iface == IFACE_I2C ? "i2c" : "spi",
+                       tcfg.pattern_len,
+                       tcfg.action_iface == IFACE_I2C ? "i2c" : "spi",
+                       tcfg.payload_len,
+                       tcfg.one_shot ? "yes" : "no");
+}
+
+/* -------------------------------------------------------------------------
+ * inject top-level command
+ * ---------------------------------------------------------------------- */
+static void cmd_inject(char **argv, int argc) {
+    if (argc < 2) {
+        usb_console_write("Usage: inject i2c|spi|config|trigger ...\r\n");
+        return;
+    }
+
+    /* inject config ... */
+    if (strcmp(argv[1], "config") == 0) {
+        cmd_inject_config(argv, argc);
+        return;
+    }
+
+    /* inject trigger ... */
+    if (strcmp(argv[1], "trigger") == 0) {
+        cmd_inject_trigger(argv, argc);
         return;
     }
 
     uint8_t buf[FRAME_DATA_MAX];
 
     if (strcmp(argv[1], "i2c") == 0) {
-        /* argv[2] = address, argv[3..] = data bytes */
+        if (argc < 4) {
+            usb_console_write("Usage: inject i2c <addr_hex> <byte…>"
+                              " [repeat N] [delay MS] [flip MASK]\r\n");
+            return;
+        }
         char *end;
         unsigned long addr = strtoul(argv[2], &end, 16);
         if (end == argv[2] || addr > 0x7F) {
             usb_console_write("Invalid I2C address.\r\n");
             return;
         }
-        int n = parse_hex_bytes(argv + 3, argc - 3, buf, sizeof(buf));
-        if (n < 0) { usb_console_write("Invalid hex bytes.\r\n"); return; }
+
+        /* Collect data bytes starting at argv[3] */
+        int n = collect_hex_bytes(argv, argc, 3, buf, sizeof(buf));
+        if (n <= 0) { usb_console_write("No valid data bytes.\r\n"); return; }
+
+        /* Apply per-command overrides to a temporary config copy */
+        fault_inject_config_t cfg;
+        fault_inject_get_config(&cfg);
+        char *val;
+        if (find_kwarg(argv, argc, 3, "repeat", &val) >= 0)
+            cfg.repeat = (uint16_t)atoi(val);
+        if (find_kwarg(argv, argc, 3, "delay", &val) >= 0)
+            cfg.repeat_delay_ms = (uint16_t)atoi(val);
+        if (find_kwarg(argv, argc, 3, "flip", &val) >= 0)
+            cfg.bit_flip_mask = (uint8_t)strtoul(val, NULL, 16);
+        fault_inject_configure(&cfg);
+
         int rc = fault_inject_send(IFACE_I2C, buf, (size_t)n, (uint8_t)addr);
         usb_console_printf("inject i2c: %s (%d bytes)\r\n",
                            rc == 0 ? "ok" : "error", n);
 
     } else if (strcmp(argv[1], "spi") == 0) {
-        int n = parse_hex_bytes(argv + 2, argc - 2, buf, sizeof(buf));
-        if (n < 0) { usb_console_write("Invalid hex bytes.\r\n"); return; }
+        if (argc < 3) {
+            usb_console_write("Usage: inject spi <byte…>"
+                              " [repeat N] [delay MS] [flip MASK]\r\n");
+            return;
+        }
+
+        int n = collect_hex_bytes(argv, argc, 2, buf, sizeof(buf));
+        if (n <= 0) { usb_console_write("No valid data bytes.\r\n"); return; }
+
+        fault_inject_config_t cfg;
+        fault_inject_get_config(&cfg);
+        char *val;
+        if (find_kwarg(argv, argc, 2, "repeat", &val) >= 0)
+            cfg.repeat = (uint16_t)atoi(val);
+        if (find_kwarg(argv, argc, 2, "delay", &val) >= 0)
+            cfg.repeat_delay_ms = (uint16_t)atoi(val);
+        if (find_kwarg(argv, argc, 2, "flip", &val) >= 0)
+            cfg.bit_flip_mask = (uint8_t)strtoul(val, NULL, 16);
+        fault_inject_configure(&cfg);
+
         int rc = fault_inject_send(IFACE_SPI, buf, (size_t)n, 0);
         usb_console_printf("inject spi: %s (%d bytes)\r\n",
                            rc == 0 ? "ok" : "error", n);
 
     } else {
-        usb_console_write("Unknown interface. Use i2c or spi.\r\n");
+        usb_console_write("Unknown sub-command. Use: inject i2c|spi|config|trigger\r\n");
     }
 }
 

@@ -44,6 +44,7 @@ target_link_libraries(pico_dev_kit
     hardware_timer
     hardware_dma
     hardware_pio
+    pico_rand
     tinyusb_device
     tinyusb_board
 )

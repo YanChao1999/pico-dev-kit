@@ -72,7 +72,9 @@ static void cmd_help(void) {
         "  record start|stop\r\n"
         "  inject i2c <addr_hex> <byte0> [byte1 …] [repeat N] [delay MS] [flip MASK]\r\n"
         "  inject spi  <byte0> [byte1 …]              [repeat N] [delay MS] [flip MASK]\r\n"
-        "  inject config [repeat N] [delay MS] [flip MASK] [pre MS] [post MS]\r\n"
+        "  inject random i2c <addr_hex> <len>         [repeat N] [delay MS] [flip MASK]\r\n"
+        "  inject random spi  <len>                   [repeat N] [delay MS] [flip MASK]\r\n"
+        "  inject config [repeat N] [delay MS] [flip MASK] [pre MS] [post MS] [random 0|1]\r\n"
         "  inject config show\r\n"
         "  inject trigger set i2c|spi pattern <hex…> payload <hex…> [addr HH] [once]\r\n"
         "  inject trigger disarm\r\n"
@@ -108,9 +110,10 @@ static void cmd_status(void) {
     fault_inject_config_t cfg;
     fault_inject_get_config(&cfg);
     usb_console_printf("Inject config: repeat=%u delay=%ums flip=0x%02X"
-                       " offset=%u pre=%ums post=%ums\r\n",
+                       " offset=%u pre=%ums post=%ums random=%s\r\n",
                        cfg.repeat, cfg.repeat_delay_ms, cfg.bit_flip_mask,
-                       cfg.byte_offset, cfg.pre_delay_ms, cfg.post_delay_ms);
+                       cfg.byte_offset, cfg.pre_delay_ms, cfg.post_delay_ms,
+                       cfg.random_payload ? "on" : "off");
 
     usb_console_printf("Trigger: %s  matches=%lu\r\n",
                        fault_inject_trigger_is_armed() ? "armed" : "disarmed",
@@ -224,7 +227,7 @@ static int find_kwarg(char **argv, int argc, int start,
  */
 static const char *s_inject_keywords[] = {
     "repeat", "delay", "flip", "pre", "post",
-    "pattern", "payload", "addr", "once",
+    "pattern", "payload", "addr", "once", "random", "offset",
     NULL
 };
 
@@ -257,9 +260,10 @@ static void cmd_inject_config(char **argv, int argc) {
         fault_inject_config_t cfg;
         fault_inject_get_config(&cfg);
         usb_console_printf("inject config: repeat=%u delay=%ums flip=0x%02X"
-                           " offset=%u pre=%ums post=%ums\r\n",
+                           " offset=%u pre=%ums post=%ums random=%s\r\n",
                            cfg.repeat, cfg.repeat_delay_ms, cfg.bit_flip_mask,
-                           cfg.byte_offset, cfg.pre_delay_ms, cfg.post_delay_ms);
+                           cfg.byte_offset, cfg.pre_delay_ms, cfg.post_delay_ms,
+                           cfg.random_payload ? "on" : "off");
         return;
     }
 
@@ -279,12 +283,15 @@ static void cmd_inject_config(char **argv, int argc) {
         cfg.pre_delay_ms = (uint16_t)atoi(val);
     if (find_kwarg(argv, argc, 2, "post", &val) >= 0)
         cfg.post_delay_ms = (uint16_t)atoi(val);
+    if (find_kwarg(argv, argc, 2, "random", &val) >= 0)
+        cfg.random_payload = (atoi(val) != 0);
 
     fault_inject_configure(&cfg);
     usb_console_printf("inject config updated: repeat=%u delay=%ums flip=0x%02X"
-                       " offset=%u pre=%ums post=%ums\r\n",
+                       " offset=%u pre=%ums post=%ums random=%s\r\n",
                        cfg.repeat, cfg.repeat_delay_ms, cfg.bit_flip_mask,
-                       cfg.byte_offset, cfg.pre_delay_ms, cfg.post_delay_ms);
+                       cfg.byte_offset, cfg.pre_delay_ms, cfg.post_delay_ms,
+                       cfg.random_payload ? "on" : "off");
 }
 
 /* -------------------------------------------------------------------------
@@ -444,6 +451,73 @@ static void cmd_inject(char **argv, int argc) {
         return;
     }
 
+    /* inject random i2c|spi ... */
+    if (strcmp(argv[1], "random") == 0) {
+        if (argc < 4) {
+            usb_console_write("Usage: inject random i2c <addr_hex> <len>"
+                              " [repeat N] [delay MS] [flip MASK]\r\n"
+                              "       inject random spi  <len>"
+                              " [repeat N] [delay MS] [flip MASK]\r\n");
+            return;
+        }
+
+        if (strcmp(argv[2], "i2c") == 0) {
+            char *end;
+            unsigned long addr = strtoul(argv[3], &end, 16);
+            if (end == argv[3] || addr > 0x7F || argc < 5) {
+                usb_console_write("Usage: inject random i2c <addr_hex> <len> ...\r\n");
+                return;
+            }
+            int len = atoi(argv[4]);
+            if (len <= 0 || len > FRAME_DATA_MAX) {
+                usb_console_write("len must be 1..256\r\n");
+                return;
+            }
+
+            fault_inject_config_t cfg;
+            fault_inject_get_config(&cfg);
+            char *val;
+            if (find_kwarg(argv, argc, 5, "repeat", &val) >= 0)
+                cfg.repeat = (uint16_t)atoi(val);
+            if (find_kwarg(argv, argc, 5, "delay", &val) >= 0)
+                cfg.repeat_delay_ms = (uint16_t)atoi(val);
+            if (find_kwarg(argv, argc, 5, "flip", &val) >= 0)
+                cfg.bit_flip_mask = (uint8_t)strtoul(val, NULL, 16);
+            fault_inject_configure(&cfg);
+
+            int rc = fault_inject_send_random(IFACE_I2C, (size_t)len,
+                                              (uint8_t)addr);
+            usb_console_printf("inject random i2c: %s (%d random bytes)\r\n",
+                               rc == 0 ? "ok" : "error", len);
+
+        } else if (strcmp(argv[2], "spi") == 0) {
+            int len = atoi(argv[3]);
+            if (len <= 0 || len > FRAME_DATA_MAX) {
+                usb_console_write("len must be 1..256\r\n");
+                return;
+            }
+
+            fault_inject_config_t cfg;
+            fault_inject_get_config(&cfg);
+            char *val;
+            if (find_kwarg(argv, argc, 4, "repeat", &val) >= 0)
+                cfg.repeat = (uint16_t)atoi(val);
+            if (find_kwarg(argv, argc, 4, "delay", &val) >= 0)
+                cfg.repeat_delay_ms = (uint16_t)atoi(val);
+            if (find_kwarg(argv, argc, 4, "flip", &val) >= 0)
+                cfg.bit_flip_mask = (uint8_t)strtoul(val, NULL, 16);
+            fault_inject_configure(&cfg);
+
+            int rc = fault_inject_send_random(IFACE_SPI, (size_t)len, 0);
+            usb_console_printf("inject random spi: %s (%d random bytes)\r\n",
+                               rc == 0 ? "ok" : "error", len);
+
+        } else {
+            usb_console_write("Unknown interface. Use i2c or spi.\r\n");
+        }
+        return;
+    }
+
     uint8_t buf[FRAME_DATA_MAX];
 
     if (strcmp(argv[1], "i2c") == 0) {
@@ -505,7 +579,7 @@ static void cmd_inject(char **argv, int argc) {
                            rc == 0 ? "ok" : "error", n);
 
     } else {
-        usb_console_write("Unknown sub-command. Use: inject i2c|spi|config|trigger\r\n");
+        usb_console_write("Unknown sub-command. Use: inject i2c|spi|random|config|trigger\r\n");
     }
 }
 

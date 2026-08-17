@@ -8,9 +8,10 @@
 #include "spi_interface.h"
 #include "recorder.h"
 #include "pico/time.h"
+#include "pico/rand.h"
 #include <string.h>
 
-static uint32_t          s_inject_count;
+static uint32_t              s_inject_count;
 static fault_inject_config_t s_config;
 
 void fault_inject_init(void) {
@@ -32,23 +33,46 @@ void fault_inject_get_config(fault_inject_config_t *cfg) {
     }
 }
 
-int fault_inject_send(interface_id_t iface,
-                      const uint8_t *data, size_t len,
-                      uint8_t addr) {
-    if (!data || len == 0 || len > FRAME_DATA_MAX) return -1;
+/* -------------------------------------------------------------------------
+ * Internal helpers
+ * ---------------------------------------------------------------------- */
 
-    /* Build a working copy so the original buffer is never modified */
-    uint8_t buf[FRAME_DATA_MAX];
-    memcpy(buf, data, len);
+/* Fill buf[0..len-1] with random bytes using the hardware RNG. */
+static void fill_random(uint8_t *buf, size_t len) {
+    size_t i = 0;
+    while (i < len) {
+        uint32_t r = get_rand_32();
+        size_t chunk = len - i;
+        if (chunk > 4) chunk = 4;
+        memcpy(buf + i, &r, chunk);
+        i += chunk;
+    }
+}
 
-    /* Apply bit-flip mask to bytes at index >= byte_offset */
+/* Copy data into buf, optionally re-randomise, then apply bit_flip_mask. */
+static void prepare_buf(uint8_t *buf, const uint8_t *data, size_t len,
+                        bool randomise) {
+    if (randomise) {
+        fill_random(buf, len);
+    } else {
+        memcpy(buf, data, len);
+    }
     if (s_config.bit_flip_mask != 0) {
         for (size_t i = s_config.byte_offset; i < len; i++) {
             buf[i] ^= s_config.bit_flip_mask;
         }
     }
+}
 
-    /* Pre-injection quiescent delay */
+/* -------------------------------------------------------------------------
+ * Shared transmission loop (used by both send variants)
+ * ---------------------------------------------------------------------- */
+static int do_send(interface_id_t iface, const uint8_t *data, size_t len,
+                   uint8_t addr, bool randomise) {
+    if (len == 0 || len > FRAME_DATA_MAX) return -1;
+
+    uint8_t buf[FRAME_DATA_MAX];
+
     if (s_config.pre_delay_ms > 0) {
         sleep_ms(s_config.pre_delay_ms);
     }
@@ -60,6 +84,9 @@ int fault_inject_send(interface_id_t iface,
         if (i > 0 && s_config.repeat_delay_ms > 0) {
             sleep_ms(s_config.repeat_delay_ms);
         }
+
+        /* Prepare working buffer (re-randomise every iteration when set) */
+        prepare_buf(buf, data, len, randomise || s_config.random_payload);
 
         int res;
         switch (iface) {
@@ -83,12 +110,27 @@ int fault_inject_send(interface_id_t iface,
         }
     }
 
-    /* Post-injection quiescent delay */
     if (s_config.post_delay_ms > 0) {
         sleep_ms(s_config.post_delay_ms);
     }
 
     return rc;
+}
+
+/* -------------------------------------------------------------------------
+ * Public API
+ * ---------------------------------------------------------------------- */
+
+int fault_inject_send(interface_id_t iface,
+                      const uint8_t *data, size_t len,
+                      uint8_t addr) {
+    if (!data || len == 0 || len > FRAME_DATA_MAX) return -1;
+    return do_send(iface, data, len, addr, false);
+}
+
+int fault_inject_send_random(interface_id_t iface, size_t len, uint8_t addr) {
+    if (len == 0 || len > FRAME_DATA_MAX) return -1;
+    return do_send(iface, NULL, len, addr, true);
 }
 
 uint32_t fault_inject_count(void) {

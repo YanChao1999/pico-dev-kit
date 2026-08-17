@@ -28,7 +28,7 @@
  *
  * All fields have zero-value defaults that reproduce the original behaviour:
  *   repeat=0, repeat_delay_ms=0, bit_flip_mask=0, byte_offset=0,
- *   pre_delay_ms=0, post_delay_ms=0.
+ *   pre_delay_ms=0, post_delay_ms=0, random_payload=false.
  */
 typedef struct {
     /** Number of *extra* transmissions after the first (0 = send once). */
@@ -53,6 +53,15 @@ typedef struct {
     uint16_t pre_delay_ms;
 
     /** Quiescent delay (ms) inserted after the last transmission. */
+    uint16_t post_delay_ms;
+
+    /**
+     * When true, fault_inject_send() re-randomises the working copy of the
+     * payload on every repeat iteration (including the first).  The caller's
+     * original buffer is never modified.  The len parameter still controls
+     * how many random bytes are generated.
+     */
+    bool random_payload;
     uint16_t post_delay_ms;
 } fault_inject_config_t;
 
@@ -94,5 +103,19 @@ int fault_inject_send(interface_id_t iface,
 
 /** Return the total number of injection operations performed. */
 uint32_t fault_inject_count(void);
+
+/**
+ * Generate a random byte sequence of the given length and inject it.
+ *
+ * The active fault_inject_config_t (pre/post delay, repeat, repeat_delay)
+ * is honoured.  bit_flip_mask is applied on top of the random bytes when
+ * non-zero.  random_payload in the config is implicitly true for this call.
+ *
+ * @param iface  Target interface (IFACE_I2C or IFACE_SPI)
+ * @param len    Number of random bytes to generate and send (1..FRAME_DATA_MAX)
+ * @param addr   I2C target address (ignored for SPI)
+ * @return       0 on success, negative on first error encountered
+ */
+int fault_inject_send_random(interface_id_t iface, size_t len, uint8_t addr);
 
 #endif /* FAULT_INJECT_H */
